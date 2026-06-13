@@ -3,16 +3,20 @@
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <LGFX_Setup.h>
 
 // ============================================
-// YOUR CORRECT SD CARD PINS (SPI MODE)
+// SD CARD - HSPI (SPI3) - osobny bus
 // ============================================
 #define SD_CS 47
 #define SD_MOSI 18
 #define SD_MISO 16
 #define SD_SCK 17
+
+// Display ma swoje piny w LGFX_Setup.h (SCK=10, MOSI=11, DC=13, CS=12, RST=14)
+// To jest na VSPI (SPI2) - domyślnie
 
 // WiFi Configuration
 const char *ap_ssid = "TDongle-FileStation";
@@ -29,8 +33,15 @@ uint64_t cardSize = 0;
 uint64_t cardFree = 0;
 int fileCount = 0;
 
+// DNS Server
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+// Osobny SPI dla SD
+SPIClass sdSpi(HSPI); // HSPI = SPI3
+
 // ============================================
-// HTML Web Interface
+// HTML Web Interface (ten sam)
 // ============================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -48,7 +59,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         button:hover { background: #2980b9; }
         .file-list { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .file-item { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
-        .file-name { text-decoration: none; color: #2c3e50; flex-grow: 1; }
+        .file-name { text-decoration: none; color: #2c3e50; flex-grow: 1; text-overflow: ellipsis; }
         .delete-btn { background: #e74c3c; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; font-size: 12px; }
         .delete-btn:hover { background: #c0392b; }
         .info { background: #d4edda; padding: 10px; border-radius: 5px; margin-bottom: 20px; text-align: center; }
@@ -177,7 +188,7 @@ void updateDisplay()
 
   display.println("");
   display.println("Open in browser:");
-  display.println("192.168.4.1");
+  display.println("192.168.4.1 | http://some.local");
 }
 
 // ============================================
@@ -209,12 +220,12 @@ void scanFiles()
 }
 
 // ============================================
-// Initialize SD Card (SPI MODE) - NO DISPLAY YET
+// Initialize SD Card - HSPI (osobny SPI)
 // ============================================
 bool initSDCard()
 {
   Serial.println("\n========================================");
-  Serial.println("Initializing SD Card (SPI Mode)");
+  Serial.println("Initializing SD Card (HSPI - separate bus)");
   Serial.println("========================================");
   Serial.printf("Pins:\n");
   Serial.printf("  CS   = GPIO%d\n", SD_CS);
@@ -222,31 +233,23 @@ bool initSDCard()
   Serial.printf("  MISO = GPIO%d\n", SD_MISO);
   Serial.printf("  SCK  = GPIO%d\n", SD_SCK);
 
-  // CRITICAL: Enable internal pull-ups
-  Serial.println("\nEnabling internal pull-ups...");
-  pinMode(SD_SCK, INPUT_PULLUP);
-  pinMode(SD_MOSI, INPUT_PULLUP);
-  pinMode(SD_MISO, INPUT_PULLUP);
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
-
-  // Initialize SPI bus for SD card ONLY
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  // Initialize dedicated SPI for SD card
+  sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
   // Try mounting at safe speed
   Serial.println("Mounting SD card at 400kHz...");
-  bool mounted = SD.begin(SD_CS, SPI, 400000);
+  bool mounted = SD.begin(SD_CS, sdSpi, 400000);
 
   if (!mounted)
   {
     Serial.println("Failed at 400kHz, trying 1MHz...");
-    mounted = SD.begin(SD_CS, SPI, 1000000);
+    mounted = SD.begin(SD_CS, sdSpi, 1000000);
   }
 
   if (!mounted)
   {
     Serial.println("Failed at 1MHz, trying 4MHz...");
-    mounted = SD.begin(SD_CS, SPI, 4000000);
+    mounted = SD.begin(SD_CS, sdSpi, 4000000);
   }
 
   if (!mounted)
@@ -267,46 +270,20 @@ bool initSDCard()
 }
 
 // ============================================
-// Initialize Display AFTER SD Card
+// Initialize Display - VSPI (domyślny SPI)
 // ============================================
 bool initDisplay()
 {
-  Serial.println("\nInitializing Display...");
+  Serial.println("\nInitializing Display (VSPI - default bus)...");
 
-  // IMPORTANT: Release SPI bus from SD card first
-  SD.end(); // This releases the SPI bus
-
-  delay(100); // Allow bus to settle
-
-  // Now initialize display on its own SPI bus (different pins)
   display.init();
   display.setRotation(1);
   display.fillScreen(TFT_BLACK);
   display.setTextColor(TFT_WHITE);
   display.setTextSize(1);
 
-  // Re-initialize SD card on its dedicated SPI bus
-  // Note: SD and Display use DIFFERENT SPI buses to avoid conflict
-  SPI.end(); // End SD card's SPI
-  delay(100);
-
-  // Re-initialize SPI for SD card only
-  pinMode(SD_SCK, INPUT_PULLUP);
-  pinMode(SD_MOSI, INPUT_PULLUP);
-  pinMode(SD_MISO, INPUT_PULLUP);
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
-
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  bool mounted = SD.begin(SD_CS, SPI, 400000);
-
-  if (mounted)
-  {
-    scanFiles(); // Refresh file count
-  }
-
   Serial.println("Display ready!");
-  return mounted;
+  return true;
 }
 
 // ============================================
@@ -410,15 +387,15 @@ void setup()
   delay(1000);
   Serial.println("\n\n=== T-Dongle FileStation ===");
 
-  // Step 1: Initialize SD card FIRST (before display)
+  // Step 1: Initialize SD card (HSPI - osobny SPI)
   bool sdOK = initSDCard();
 
-  // Step 2: Initialize display (this will temporarily release SD)
+  // Step 2: Initialize display (VSPI - domyślny SPI, NIE koliduje!)
   bool displayOK = initDisplay();
 
   if (sdOK && displayOK)
   {
-    Serial.println("\n✅ Both SD card and Display are working!");
+    Serial.println("\n✅ Both SD card and Display are working on separate SPI buses!");
   }
   else if (sdOK)
   {
@@ -431,12 +408,18 @@ void setup()
 
   // Start WiFi AP
   Serial.println("\nStarting WiFi AP...");
+  WiFi.setSleep(false);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(ap_ssid, ap_password, 1, 0, 6);
+  WiFi.softAP(ap_ssid, ap_password, 6, 0, 6);
+
+  // Start DNS server
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  Serial.println("DNS started - any domain works");
 
   IPAddress IP = WiFi.softAPIP();
 
-  // Update display with final info
+  // Update display
   if (displayOK)
   {
     updateDisplay();
@@ -457,6 +440,8 @@ void setup()
 // ============================================
 void loop()
 {
+  dnsServer.processNextRequest();
+
   static unsigned long lastScan = 0;
 
   if (millis() - lastScan > 10000 && cardSize > 0)
