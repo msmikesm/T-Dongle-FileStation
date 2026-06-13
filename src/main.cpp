@@ -3,45 +3,36 @@
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
-#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <LGFX_Setup.h>
 
 // ============================================
-// SD CARD - HSPI (SPI3) - osobny bus
+// SD CARD PINS
 // ============================================
 #define SD_CS 47
 #define SD_MOSI 18
 #define SD_MISO 16
 #define SD_SCK 17
 
-// Display ma swoje piny w LGFX_Setup.h (SCK=10, MOSI=11, DC=13, CS=12, RST=14)
-// To jest na VSPI (SPI2) - domyślnie
-
-// WiFi Configuration
+// WiFi
 const char *ap_ssid = "TDongle-FileStation";
 const char *ap_password = "12345678";
 
-// Web server
+// Server
 AsyncWebServer server(80);
 
 // Display
 LGFX display;
 
-// SD card info
-uint64_t cardSize = 0;
-uint64_t cardFree = 0;
-int fileCount = 0;
+// SD status
+bool sdOk = false;
 
-// DNS Server
-DNSServer dnsServer;
-const byte DNS_PORT = 53;
-
-// Osobny SPI dla SD
-SPIClass sdSpi(HSPI); // HSPI = SPI3
+// Operation lock - only ONE operation at a time!
+volatile bool sdBusy = false;
+SPIClass sdSpi(HSPI);
 
 // ============================================
-// HTML Web Interface (ten sam)
+// HTML - manual refresh only
 // ============================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -51,114 +42,198 @@ const char index_html[] PROGMEM = R"rawliteral(
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>T-Dongle FileStation</title>
     <style>
-        body { font-family: Arial; max-width: 800px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        * { box-sizing: border-box; }
+        body { font-family: Arial; max-width: 1000px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
         h1 { color: #2c3e50; text-align: center; }
-        .upload-form { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        input[type="file"] { margin: 10px 0; padding: 10px; }
-        button { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; }
-        button:hover { background: #2980b9; }
-        .file-list { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .card { background: white; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .upload-area { border: 2px dashed #3498db; border-radius: 10px; padding: 30px; text-align: center; cursor: pointer; }
+        .upload-area.drag-over { background: #e3f2fd; }
+        .btn { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; margin: 5px; }
+        .btn:hover { background: #2980b9; }
+        .btn-refresh { background: #27ae60; }
+        .btn-refresh:hover { background: #219a52; }
+        .queue-item { background: #f8f9fa; margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .progress-bar { background: #e0e0e0; border-radius: 5px; height: 20px; overflow: hidden; margin-top: 5px; }
+        .progress-fill { background: #4caf50; height: 100%; width: 0%; }
         .file-item { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
-        .file-name { text-decoration: none; color: #2c3e50; flex-grow: 1; text-overflow: ellipsis; }
-        .delete-btn { background: #e74c3c; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; font-size: 12px; }
-        .delete-btn:hover { background: #c0392b; }
+        .file-name { color: #2c3e50; flex-grow: 1; text-decoration: none; }
+        .delete-btn { background: #e74c3c; color: white; border: none; padding: 5px 10px; border-radius: 3px; cursor: pointer; }
         .info { background: #d4edda; padding: 10px; border-radius: 5px; margin-bottom: 20px; text-align: center; }
-        hr { margin: 20px 0; }
+        .info-busy { background: #f39c12; color: white; }
+        .info-error { background: #e74c3c; color: white; }
+        .badge { background: #3498db; color: white; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-left: 10px; }
     </style>
 </head>
 <body>
     <h1>📁 T-Dongle FileStation</h1>
     <div class="info" id="info">Loading...</div>
     
-    <div class="upload-form">
-        <h3>📤 Upload File</h3>
-        <form action="/upload" method="POST" enctype="multipart/form-data" id="upload-form">
-            <input type="file" name="file" id="file-input" required>
-            <button type="submit">Upload</button>
-        </form>
-        <div id="upload-status"></div>
+    <div class="card">
+        <h3>📤 Upload Files</h3>
+        <div class="upload-area" id="dropZone">
+            <p>📂 Drag & drop or click to select</p>
+            <button class="btn" id="selectBtn">Select Files</button>
+            <input type="file" id="fileInput" multiple style="display:none">
+        </div>
+        <div id="queueContainer"></div>
     </div>
     
-    <div class="file-list">
-        <h3>📄 Files on SD Card</h3>
-        <div id="file-list">Loading...</div>
+    <div class="card">
+        <h3 style="display: inline-block;">📄 Files</h3>
+        <span class="badge" id="fileCountBadge">0</span>
+        <button class="btn btn-refresh" id="refreshBtn" style="float: right;">🔄 Refresh</button>
+        <div style="clear: both;"></div>
+        <div id="fileList">Loading...</div>
     </div>
-    
-    <hr>
-    <p style="text-align: center; color: #7f8c8d; font-size: 12px;">ESP32-S3 T-Dongle FileStation</p>
     
     <script>
-        function loadFiles() {
-            fetch('/api/files')
-                .then(response => response.json())
-                .then(data => {
-                    const infoDiv = document.getElementById('info');
-                    infoDiv.innerHTML = '💾 SD Card: ' + data.used + ' / ' + data.total + ' MB | 📄 Files: ' + data.count;
-                    
-                    const fileList = document.getElementById('file-list');
-                    if (data.files.length === 0) {
-                        fileList.innerHTML = '<p style="color: #7f8c8d;">No files. Upload something above!</p>';
-                        return;
-                    }
-                    
-                    let html = '';
-                    for (let i = 0; i < data.files.length; i++) {
-                        let file = data.files[i];
-                        html += '<div class="file-item">' +
-                            '<a href="/download/' + encodeURIComponent(file.name) + '" class="file-name">📄 ' + file.name + ' (' + file.size + ' KB)</a>' +
-                            '<button class="delete-btn" onclick="deleteFile(\'' + file.name.replace(/'/g, "\\'") + '\')">🗑️ Delete</button>' +
-                            '</div>';
-                    }
-                    fileList.innerHTML = html;
-                });
+        let queue = [];
+        let uploading = false;
+        
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const selectBtn = document.getElementById('selectBtn');
+        const refreshBtn = document.getElementById('refreshBtn');
+        
+        dropZone.onclick = () => fileInput.click();
+        dropZone.ondragover = (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); };
+        dropZone.ondragleave = () => dropZone.classList.remove('drag-over');
+        dropZone.ondrop = (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-over');
+            addFiles(e.dataTransfer.files);
+        };
+        fileInput.onchange = (e) => addFiles(e.target.files);
+        selectBtn.onclick = (e) => { e.stopPropagation(); fileInput.click(); };
+        refreshBtn.onclick = () => loadFiles();
+        
+        function addFiles(files) {
+            for (let f of files) {
+                queue.push({ id: Date.now() + Math.random(), file: f, progress: 0, status: 'pending' });
+            }
+            renderQueue();
+            processQueue();
         }
         
-        function deleteFile(filename) {
-            if (confirm('Delete ' + filename + '?')) {
-                fetch('/api/delete/' + encodeURIComponent(filename), { method: 'DELETE' })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.success) {
-                            loadFiles();
-                        } else {
-                            alert('Delete failed: ' + data.error);
-                        }
-                    });
+        function renderQueue() {
+            let html = '<h4>Queue:</h4>';
+            for (let item of queue) {
+                let status = item.status === 'uploading' ? '⏫ Uploading...' : (item.status === 'success' ? '✅ Done' : (item.status === 'error' ? '❌ Failed' : '⏳ Waiting'));
+                html += `<div class="queue-item">
+                    <div>📄 ${item.file.name} (${(item.file.size/1024).toFixed(1)} KB) - ${status}</div>
+                    <div class="progress-bar"><div class="progress-fill" style="width: ${item.progress}%"></div></div>
+                </div>`;
+            }
+            document.getElementById('queueContainer').innerHTML = html || '';
+        }
+        
+        async function processQueue() {
+            if (uploading) return;
+            let next = queue.find(i => i.status === 'pending');
+            if (!next) return;
+            
+            uploading = true;
+            next.status = 'uploading';
+            renderQueue();
+            
+            try {
+                let formData = new FormData();
+                formData.append('file', next.file);
+                
+                let xhr = new XMLHttpRequest();
+                xhr.open('POST', '/upload');
+                xhr.upload.onprogress = (e) => { if (e.lengthComputable) { next.progress = (e.loaded / e.total) * 100; renderQueue(); } };
+                
+                await new Promise((resolve, reject) => {
+                    xhr.onload = () => xhr.status === 200 ? resolve() : reject();
+                    xhr.onerror = () => reject();
+                    xhr.send(formData);
+                });
+                
+                next.status = 'success';
+                next.progress = 100;
+                renderQueue();
+            } catch(e) {
+                next.status = 'error';
+                renderQueue();
+            }
+            
+            uploading = false;
+            processQueue();
+        }
+        
+        async function loadFiles() {
+            let infoDiv = document.getElementById('info');
+            infoDiv.innerHTML = '⏳ Loading...';
+            infoDiv.className = 'info';
+            
+            try {
+                let res = await fetch('/api/files');
+                let data = await res.json();
+                
+                if (data.error) {
+                    infoDiv.innerHTML = `❌ ${data.error}`;
+                    infoDiv.className = 'info info-error';
+                    return;
+                }
+                
+                infoDiv.innerHTML = `💾 SD: ${data.used} / ${data.total} MB | Files: ${data.count}`;
+                document.getElementById('fileCountBadge').innerText = data.count;
+                
+                if (!data.files || data.files.length === 0) {
+                    document.getElementById('fileList').innerHTML = '<p>No files</p>';
+                    return;
+                }
+                
+                let html = '';
+                for (let f of data.files) {
+                    html += `<div class="file-item">
+                        <a href="/download/${encodeURIComponent(f.name)}" class="file-name" target="_blank">📄 ${f.name} (${f.size} KB)</a>
+                        <button class="delete-btn" onclick="deleteFile('${f.name.replace(/'/g, "\\'")}')">Delete</button>
+                    </div>`;
+                }
+                document.getElementById('fileList').innerHTML = html;
+            } catch(e) {
+                infoDiv.innerHTML = '❌ Connection error';
+                infoDiv.className = 'info info-error';
             }
         }
         
-        document.getElementById('upload-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            const formData = new FormData(this);
-            const statusDiv = document.getElementById('upload-status');
-            statusDiv.innerHTML = '<p>Uploading...</p>';
+        async function deleteFile(name) {
+            if (!confirm('Delete?')) return;
             
-            fetch('/upload', { method: 'POST', body: formData })
-                .then(response => response.json())
-                .then(data => {
-                    if (data.success) {
-                        statusDiv.innerHTML = '<p style="color: green;">✅ ' + data.message + '</p>';
-                        document.getElementById('file-input').value = '';
-                        loadFiles();
-                        setTimeout(function() { statusDiv.innerHTML = ''; }, 3000);
-                    } else {
-                        statusDiv.innerHTML = '<p style="color: red;">❌ Error: ' + data.error + '</p>';
-                    }
-                });
-        });
+            let infoDiv = document.getElementById('info');
+            infoDiv.innerHTML = '⏳ Deleting...';
+            
+            try {
+                let res = await fetch('/api/delete/' + encodeURIComponent(name), { method: 'DELETE' });
+                let data = await res.json();
+                if (data.success) {
+                    loadFiles();
+                } else {
+                    infoDiv.innerHTML = `❌ ${data.error}`;
+                    infoDiv.className = 'info info-error';
+                }
+            } catch(e) {
+                infoDiv.innerHTML = '❌ Delete failed';
+                infoDiv.className = 'info info-error';
+            }
+        }
         
+        // Load files ONCE on page load
         loadFiles();
-        setInterval(loadFiles, 5000);
     </script>
 </body>
 </html>
 )rawliteral";
 
 // ============================================
-// Update Display
+// Display - ONLY at startup
 // ============================================
-void updateDisplay()
+void showStartupStatus()
 {
+  display.init();
+  display.setRotation(1);
   display.fillScreen(TFT_BLACK);
   display.setTextColor(TFT_WHITE);
   display.setTextSize(1);
@@ -168,214 +243,89 @@ void updateDisplay()
   display.println("");
   display.print("WiFi: ");
   display.println(ap_ssid);
-  display.print("IP: 192.168.4.1");
+  display.print("IP: ");
+  display.println(WiFi.softAPIP().toString());
   display.println("");
 
-  if (cardSize > 0)
+  if (sdOk)
   {
-    display.print("SD: ");
-    display.print((cardSize - cardFree) / 1048576);
-    display.print("/");
-    display.print(cardSize / 1048576);
+    display.println("SD Card: READY");
+    display.print("Size: ");
+    display.print(SD.totalBytes() / 1048576);
     display.println(" MB");
-    display.print("Files: ");
-    display.println(fileCount);
   }
   else
   {
-    display.println("SD: NO CARD!");
+    display.println("SD Card: ERROR");
   }
-
-  display.println("");
-  display.println("Open in browser:");
-  display.println("192.168.4.1 | http://some.local");
 }
 
 // ============================================
-// Scan SD Card
+// SD Card init
 // ============================================
-void scanFiles()
+bool initSD()
 {
-  File root = SD.open("/");
-  if (!root)
-  {
-    fileCount = 0;
-    return;
-  }
-
-  fileCount = 0;
-  cardFree = SD.totalBytes() - SD.usedBytes();
-  cardSize = SD.totalBytes();
-
-  File file = root.openNextFile();
-  while (file)
-  {
-    if (!file.isDirectory())
-    {
-      fileCount++;
-    }
-    file = root.openNextFile();
-  }
-  root.close();
-}
-
-// ============================================
-// Initialize SD Card - HSPI (osobny SPI)
-// ============================================
-bool initSDCard()
-{
-  Serial.println("\n========================================");
-  Serial.println("Initializing SD Card (HSPI - separate bus)");
-  Serial.println("========================================");
-  Serial.printf("Pins:\n");
-  Serial.printf("  CS   = GPIO%d\n", SD_CS);
-  Serial.printf("  MOSI = GPIO%d\n", SD_MOSI);
-  Serial.printf("  MISO = GPIO%d\n", SD_MISO);
-  Serial.printf("  SCK  = GPIO%d\n", SD_SCK);
-
-  // Initialize dedicated SPI for SD card
   sdSpi.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
 
-  // Try mounting at safe speed
-  Serial.println("Mounting SD card at 400kHz...");
-  bool mounted = SD.begin(SD_CS, sdSpi, 400000);
-
-  if (!mounted)
+  if (!SD.begin(SD_CS, sdSpi, 4000000))
   {
-    Serial.println("Failed at 400kHz, trying 1MHz...");
-    mounted = SD.begin(SD_CS, sdSpi, 1000000);
+    if (!SD.begin(SD_CS, sdSpi, 1000000))
+    {
+      if (!SD.begin(SD_CS, sdSpi, 400000))
+      {
+        return false;
+      }
+    }
   }
-
-  if (!mounted)
-  {
-    Serial.println("Failed at 1MHz, trying 4MHz...");
-    mounted = SD.begin(SD_CS, sdSpi, 4000000);
-  }
-
-  if (!mounted)
-  {
-    Serial.println("\n❌ SD Card initialization FAILED!");
-    return false;
-  }
-
-  // Success
-  cardSize = SD.totalBytes();
-  cardFree = cardSize - SD.usedBytes();
-
-  Serial.println("\n✅✅✅ SD CARD MOUNTED SUCCESSFULLY! ✅✅✅");
-  Serial.printf("  Total size: %llu MB\n", cardSize / 1048576);
-  Serial.printf("  Free space: %llu MB\n", cardFree / 1048576);
-
   return true;
 }
 
 // ============================================
-// Initialize Display - VSPI (domyślny SPI)
+// Get file list safely
 // ============================================
-bool initDisplay()
+String getFileList()
 {
-  Serial.println("\nInitializing Display (VSPI - default bus)...");
+  if (sdBusy)
+  {
+    return "{\"error\":\"SD card busy, try again later\"}";
+  }
 
-  display.init();
-  display.setRotation(1);
-  display.fillScreen(TFT_BLACK);
-  display.setTextColor(TFT_WHITE);
-  display.setTextSize(1);
+  sdBusy = true;
 
-  Serial.println("Display ready!");
-  return true;
-}
+  uint64_t total = SD.totalBytes();
+  uint64_t used = SD.usedBytes();
 
-// ============================================
-// Setup API Endpoints
-// ============================================
-void setupFileAPI()
-{
-  // API: Get file list
-  server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest *request)
-            {
-        String json = "{\"total\":" + String(cardSize / 1048576) + 
-                      ",\"used\":" + String((cardSize - cardFree) / 1048576) +
-                      ",\"count\":" + String(fileCount) + ",\"files\":[";
-        
-        File root = SD.open("/");
-        File file = root.openNextFile();
-        bool first = true;
-        while (file) {
-            if (!file.isDirectory()) {
-                if (!first) json += ",";
-                json += "{\"name\":\"" + String(file.name()) + "\",\"size\":" + String(file.size() / 1024) + "}";
-                first = false;
-            }
-            file = root.openNextFile();
-        }
-        root.close();
-        json += "]}";
-        request->send(200, "application/json", json); });
+  String json = "{\"total\":" + String(total / 1048576) +
+                ",\"used\":" + String(used / 1048576) +
+                ",\"count\":0,\"files\":[";
 
-  // API: Upload file
-  server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request)
-            { request->send(200, "application/json", "{\"success\":true,\"message\":\"File uploaded\"}"); }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
-            {
-        static File uploadFile;
-        
-        if (!index) {
-            String path = "/" + filename;
-            uploadFile = SD.open(path, FILE_WRITE);
-            if (!uploadFile) {
-                request->send(500, "application/json", "{\"success\":false,\"error\":\"Cannot create file\"}");
-                return;
-            }
-        }
-        
-        if (uploadFile && len > 0) {
-            uploadFile.write(data, len);
-        }
-        
-        if (final && uploadFile) {
-            uploadFile.close();
-            scanFiles();
-            updateDisplay();
-        } });
+  File root = SD.open("/");
+  if (root)
+  {
+    File f = root.openNextFile();
+    bool first = true;
+    int cnt = 0;
+    while (f)
+    {
+      if (!f.isDirectory())
+      {
+        if (!first)
+          json += ",";
+        String name = String(f.name());
+        name.replace("\"", "\\\"");
+        json += "{\"name\":\"" + name + "\",\"size\":" + String(f.size() / 1024) + "}";
+        first = false;
+        cnt++;
+      }
+      f = root.openNextFile();
+    }
+    root.close();
+    json.replace("\"count\":0", "\"count\":" + String(cnt));
+  }
+  json += "]}";
 
-  // Handle dynamic routes
-  server.onNotFound([](AsyncWebServerRequest *request)
-                    {
-        String url = request->url();
-        String method = request->methodToString();
-        
-        if (url.startsWith("/api/delete/") && method == "DELETE") {
-            String filename = url.substring(12);
-            String path = "/" + filename;
-            
-            if (SD.remove(path)) {
-                scanFiles();
-                updateDisplay();
-                request->send(200, "application/json", "{\"success\":true,\"message\":\"File deleted\"}");
-            } else {
-                request->send(500, "application/json", "{\"success\":false,\"error\":\"Delete failed\"}");
-            }
-        }
-        else if (url.startsWith("/download/") && method == "GET") {
-            String filename = url.substring(9);
-            filename.replace("%20", " ");
-            String path = "/" + filename;
-            
-            if (SD.exists(path)) {
-                request->send(SD, path, "application/octet-stream");
-            } else {
-                request->send(404, "text/plain", "File not found: " + filename);
-            }
-        }
-        else if (url == "/" && method == "GET") {
-            request->send(200, "text/html", index_html);
-        }
-        else {
-            request->send(404, "text/plain", "Not found");
-        } });
-
-  server.begin();
-  Serial.println("HTTP server started");
+  sdBusy = false;
+  return json;
 }
 
 // ============================================
@@ -385,71 +335,116 @@ void setup()
 {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n\n=== T-Dongle FileStation ===");
 
-  // Step 1: Initialize SD card (HSPI - osobny SPI)
-  bool sdOK = initSDCard();
+  // SD card
+  sdOk = initSD();
 
-  // Step 2: Initialize display (VSPI - domyślny SPI, NIE koliduje!)
-  bool displayOK = initDisplay();
-
-  if (sdOK && displayOK)
-  {
-    Serial.println("\n✅ Both SD card and Display are working on separate SPI buses!");
-  }
-  else if (sdOK)
-  {
-    Serial.println("\n⚠️ SD card OK, but display has issues");
-  }
-  else
-  {
-    Serial.println("\n❌ SD card failed - check connections");
-  }
-
-  // Start WiFi AP
-  Serial.println("\nStarting WiFi AP...");
-  WiFi.setSleep(false);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  // WiFi AP
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(ap_ssid, ap_password, 6, 0, 6);
+  WiFi.softAP(ap_ssid, ap_password);
 
-  // Start DNS server
-  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
-  Serial.println("DNS started - any domain works");
+  // Display startup status (ONCE)
+  showStartupStatus();
 
-  IPAddress IP = WiFi.softAPIP();
+  // ============================================
+  // API - all operations respect sdBusy lock
+  // ============================================
 
-  // Update display
-  if (displayOK)
-  {
-    updateDisplay();
-  }
+  // Get file list
+  server.on("/api/files", HTTP_GET, [](AsyncWebServerRequest *request)
+            { request->send(200, "application/json", getFileList()); });
 
-  // Start web server
-  setupFileAPI();
+  // Upload file
+  server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request)
+            { request->send(200, "application/json", "{\"success\":true}"); }, [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
+            {
+      static File f;
+      
+      if (!index) {
+        // Wait if busy
+        while (sdBusy) delay(10);
+        sdBusy = true;
+        
+        String path = "/" + filename;
+        f = SD.open(path, FILE_WRITE);
+        if (!f) {
+          sdBusy = false;
+          return;
+        }
+      }
+      
+      if (f && len > 0) {
+        f.write(data, len);
+      }
+      
+      if (final && f) {
+        f.close();
+        sdBusy = false;
+      } });
 
-  Serial.println("\n========================================");
-  Serial.println("Setup Complete!");
-  Serial.printf("WiFi AP: %s (password: %s)\n", ap_ssid, ap_password);
-  Serial.printf("Open http://%s in your browser\n", IP.toString().c_str());
-  Serial.println("========================================\n");
+  // Delete file
+  server.onNotFound([](AsyncWebServerRequest *request)
+                    {
+    String url = request->url();
+    String method = request->methodToString();
+    
+    if (url.startsWith("/api/delete/") && method == "DELETE") {
+      // Wait if busy
+      while (sdBusy) delay(10);
+      sdBusy = true;
+      
+      String filename = url.substring(12);
+      String path = "/" + filename;
+      
+      bool success = SD.remove(path);
+      sdBusy = false;
+      
+      if (success) {
+        request->send(200, "application/json", "{\"success\":true}");
+      } else {
+        request->send(500, "application/json", "{\"success\":false,\"error\":\"Delete failed\"}");
+      }
+    }
+    else if (url.startsWith("/download/") && method == "GET") {
+      // Wait if busy
+      while (sdBusy) delay(10);
+      sdBusy = true;
+      
+      String filename = url.substring(9);
+      filename.replace("%20", " ");
+      String path = "/" + filename;
+      
+      if (SD.exists(path)) {
+        String contentType = "application/octet-stream";
+        if (filename.endsWith(".txt") || filename.endsWith(".html") || filename.endsWith(".css") || filename.endsWith(".js")) {
+          contentType = "text/plain";
+        } else if (filename.endsWith(".jpg") || filename.endsWith(".jpeg")) {
+          contentType = "image/jpeg";
+        } else if (filename.endsWith(".png")) {
+          contentType = "image/png";
+        } else if (filename.endsWith(".pdf")) {
+          contentType = "application/pdf";
+        }
+        
+        request->send(SD, path, contentType);
+        sdBusy = false;
+      } else {
+        sdBusy = false;
+        request->send(404, "text/plain", "File not found");
+      }
+    }
+    else if (url == "/" && method == "GET") {
+      request->send(200, "text/html", index_html);
+    }
+    else {
+      request->send(404);
+    } });
+
+  server.begin();
+  Serial.printf("Server ready: http://%s\n", WiFi.softAPIP().toString().c_str());
 }
 
-// ============================================
-// Loop
-// ============================================
 void loop()
 {
-  dnsServer.processNextRequest();
-
-  static unsigned long lastScan = 0;
-
-  if (millis() - lastScan > 10000 && cardSize > 0)
-  {
-    scanFiles();
-    updateDisplay();
-    lastScan = millis();
-  }
-
   delay(100);
 }
